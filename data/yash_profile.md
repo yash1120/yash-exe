@@ -9,6 +9,7 @@ This is the source-of-truth profile that Yash.exe speaks from. Edit this file to
 - **Email:** yashgoyal1120@gmail.com
 - **Phone:** +61 402 412 386
 - **LinkedIn:** linkedin.com/in/yashgoyal11
+- **GitHub:** github.com/yash1120
 
 ## Short bio (the voice / tone)
 

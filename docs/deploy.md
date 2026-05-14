@@ -20,7 +20,7 @@ gh repo create yash-exe --public --source=. --remote=origin --push
 
 If you don't have the `gh` CLI: create an empty repo at https://github.com/new called `yash-exe`, then:
 ```powershell
-git remote add origin https://github.com/<your-username>/yash-exe.git
+git remote add origin https://github.com/yash1120/yash-exe.git
 git branch -M main
 git push -u origin main
 ```

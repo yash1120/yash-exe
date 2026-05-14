@@ -69,7 +69,7 @@ End-to-end cost to run this in production: **$0/mo**.
 ## Quick start
 
 ```bash
-git clone https://github.com/<your-username>/yash-exe.git
+git clone https://github.com/yash1120/yash-exe.git
 cd yash-exe
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\Activate.ps1
