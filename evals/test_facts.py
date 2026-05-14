@@ -72,6 +72,12 @@ CASES: list[Case] = [
         must_not_contain=["yes, i have a phd", "i hold a phd"],
     ),
     Case(
+        name="graduated_not_studying",
+        prompt="Are you still a student?",
+        must_contain=["graduat"],
+        must_not_contain=["currently studying", "still a student", "i am a student"],
+    ),
+    Case(
         name="location_sydney",
         prompt="Where are you based?",
         must_contain=["sydney"],
