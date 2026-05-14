@@ -1,0 +1,29 @@
+# Render free-tier blueprint for Yash.exe.
+# Deploy: push this repo to GitHub, then in Render: New → Blueprint → connect repo.
+# Render auto-detects this file and provisions the service.
+#
+# After first deploy, open the service → Environment → set GROQ_API_KEY to your key
+# from https://console.groq.com/keys. (It's marked sync:false so it's never committed.)
+
+services:
+  - type: web
+    name: yash-exe
+    runtime: python
+    plan: free
+    region: oregon          # change to singapore/frankfurt/ohio if you want lower latency
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false                       # set in Render dashboard, never committed
+      - key: YASH_EXE_MODEL
+        value: llama-3.3-70b-versatile
+      - key: YASH_EXE_VOICE
+        value: en-AU-WilliamNeural
+      - key: YASH_EXE_MAX_TOKENS
+        value: "512"
+      - key: PYTHON_VERSION
+        value: "3.12"
