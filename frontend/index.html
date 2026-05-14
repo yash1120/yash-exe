@@ -71,11 +71,14 @@
           </div>
         </div>
 
+        <div id="voice-status" class="voice-status" hidden aria-live="polite"></div>
+
         <form id="composer" class="composer">
-          <button type="button" id="mic-btn" class="icon-btn" aria-label="Toggle microphone" title="Tap to speak">
-            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M19 11a7 7 0 0 1-14 0"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="8" y1="22" x2="16" y2="22"/></svg>
+          <button type="button" id="mic-btn" class="mic-btn-big" aria-label="Tap to speak" title="Tap to speak — Yash will listen and reply with voice">
+            <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M19 11a7 7 0 0 1-14 0"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="8" y1="22" x2="16" y2="22"/></svg>
+            <span class="mic-btn-hint">Tap to speak</span>
           </button>
-          <input id="input" type="text" autocomplete="off" placeholder="Ask a question…" />
+          <input id="input" type="text" autocomplete="off" placeholder="Or type a question…" />
           <button type="submit" id="send-btn" class="primary-btn">
             <span class="btn-label">Send</span>
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
@@ -86,10 +89,6 @@
         </form>
 
         <div class="toolbar">
-          <div id="audio-indicator" class="audio-indicator" hidden>
-            <span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span>
-            <span>speaking</span>
-          </div>
           <button type="button" id="clear-btn" class="text-btn">Clear conversation</button>
         </div>
       </section>

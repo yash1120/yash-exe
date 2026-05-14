@@ -6,8 +6,12 @@
 //   chunks (sentence-ending punctuation + space, min 30 chars) — each chunk fires a
 //   parallel /api/tts request. TTS requests synthesize concurrently.
 // - Audio blobs play strictly in order via an in-order queue.
-// - Result: first audio typically plays ~1.0-1.5s after the user finishes speaking,
-//   vs ~5s if we waited for the full LLM reply before calling TTS.
+// - First audio plays ~1.0-1.5s after the user finishes speaking.
+//
+// Voice UX:
+// - A prominent status banner above the composer shows "Listening" (with live transcript)
+//   and "Yash is speaking" (with audio waves) so the user always knows the system's state.
+// - Web Speech API's interimResults stream gives a live preview of the transcription.
 
 const chatEl = document.getElementById("chat");
 const welcomeEl = document.getElementById("welcome");
@@ -17,8 +21,8 @@ const micBtn = document.getElementById("mic-btn");
 const sendBtn = document.getElementById("send-btn");
 const stopBtn = document.getElementById("stop-btn");
 const clearBtn = document.getElementById("clear-btn");
-const audioIndicator = document.getElementById("audio-indicator");
 const chipsEl = document.getElementById("chips");
+const voiceStatusEl = document.getElementById("voice-status");
 
 const history = [];
 let voiceMode = false;
@@ -31,8 +35,8 @@ let isPlayingAudio = false;
 let currentAudio = null;
 let ttsAborter = null;
 
-const MIN_CHUNK_LEN = 30;       // don't fire TTS for tiny scraps
-const LONG_NO_PUNCT_LEN = 90;   // emergency-flush on comma if no period yet
+const MIN_CHUNK_LEN = 30;
+const LONG_NO_PUNCT_LEN = 90;
 
 // --- UI helpers ---
 
@@ -56,6 +60,51 @@ function setBusy(busy) {
   stopBtn.hidden = !busy;
 }
 
+// --- Voice status banner ---
+
+const MIC_SVG = `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M19 11a7 7 0 0 1-14 0"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="8" y1="22" x2="16" y2="22"/></svg>`;
+
+function showVoiceStatus(state, opts = {}) {
+  if (!state) {
+    voiceStatusEl.hidden = true;
+    voiceStatusEl.className = "voice-status";
+    voiceStatusEl.innerHTML = "";
+    return;
+  }
+  voiceStatusEl.hidden = false;
+  voiceStatusEl.className = `voice-status ${state}`;
+
+  if (state === "listening") {
+    const sub = opts.transcript
+      ? `“${escapeHtml(opts.transcript)}”`
+      : "Speak now — I'm listening";
+    voiceStatusEl.innerHTML = `
+      <span class="voice-icon">${MIC_SVG}</span>
+      <div class="voice-text">
+        <strong>Listening</strong>
+        <span class="voice-sub" id="live-transcript">${sub}</span>
+      </div>`;
+  } else if (state === "speaking") {
+    voiceStatusEl.innerHTML = `
+      <div class="voice-waves">
+        <span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span>
+      </div>
+      <div class="voice-text">
+        <strong>Yash is speaking</strong>
+        <span class="voice-sub">tap the mic to interrupt</span>
+      </div>`;
+  }
+}
+
+function updateLiveTranscript(text) {
+  const el = document.getElementById("live-transcript");
+  if (el) el.textContent = text ? `“${text}”` : "Speak now — I'm listening";
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+}
+
 // --- TTS pipeline ---
 
 async function synthesizeBlob(text, signal) {
@@ -76,9 +125,6 @@ async function synthesizeBlob(text, signal) {
 function queueSpeak(text) {
   const trimmed = text && text.trim();
   if (!trimmed) return;
-  audioIndicator.hidden = false;
-  // Kick off the TTS request immediately — it runs in parallel with any prior
-  // requests so total TTFA scales with the slowest single sentence, not the sum.
   audioQueue.push(synthesizeBlob(trimmed, ttsAborter?.signal));
   playNextAudio();
 }
@@ -86,11 +132,11 @@ function queueSpeak(text) {
 async function playNextAudio() {
   if (isPlayingAudio) return;
   if (audioQueue.length === 0) {
-    audioIndicator.hidden = true;
+    if (voiceStatusEl.classList.contains("speaking")) showVoiceStatus(null);
     return;
   }
   isPlayingAudio = true;
-  audioIndicator.hidden = false;
+  showVoiceStatus("speaking");
   const blob = await audioQueue.shift();
   if (!blob || !blob.size) {
     isPlayingAudio = false;
@@ -128,15 +174,11 @@ function stopSpeaking() {
     try { currentAudio.pause(); } catch {}
     currentAudio = null;
   }
-  audioIndicator.hidden = true;
+  if (voiceStatusEl.classList.contains("speaking")) showVoiceStatus(null);
 }
 
-// Given the running buffer of LLM text, return [chunkToSpeak, leftover] if a
-// speakable boundary is available, else null.
 function takeSpeakableChunk(buffer) {
   if (buffer.length < MIN_CHUNK_LEN) return null;
-
-  // Find the last sentence-ending punctuation followed by whitespace.
   let lastIdx = -1;
   const re = /[.!?]\s+/g;
   let m;
@@ -146,9 +188,6 @@ function takeSpeakableChunk(buffer) {
   if (lastIdx >= MIN_CHUNK_LEN) {
     return [buffer.slice(0, lastIdx).trim(), buffer.slice(lastIdx)];
   }
-
-  // Fallback: if the buffer is getting long and there's no sentence break,
-  // chunk on a comma so audio keeps flowing.
   if (buffer.length > LONG_NO_PUNCT_LEN) {
     const commaIdx = buffer.lastIndexOf(", ");
     if (commaIdx > MIN_CHUNK_LEN) {
@@ -272,21 +311,47 @@ let listening = false;
 if (SR) {
   recognition = new SR();
   recognition.continuous = false;
-  recognition.interimResults = false;
+  recognition.interimResults = true;
   recognition.lang = "en-AU";
 
-  recognition.onresult = (evt) => {
-    const transcript = evt.results[0][0].transcript;
-    voiceMode = true;
-    sendMessage(transcript);
+  recognition.onstart = () => {
+    showVoiceStatus("listening");
   };
+
+  recognition.onresult = (evt) => {
+    let interim = "";
+    let final = "";
+    for (let i = evt.resultIndex; i < evt.results.length; i++) {
+      const t = evt.results[i][0].transcript;
+      if (evt.results[i].isFinal) final += t;
+      else interim += t;
+    }
+    if (interim && !final) {
+      updateLiveTranscript(interim.trim());
+    }
+    if (final.trim()) {
+      voiceMode = true;
+      showVoiceStatus(null);
+      sendMessage(final.trim());
+    }
+  };
+
   recognition.onend = () => {
     listening = false;
     micBtn.classList.remove("listening");
+    // If we ended without a final result, hide the banner.
+    if (!voiceMode && voiceStatusEl.classList.contains("listening")) {
+      showVoiceStatus(null);
+    }
   };
-  recognition.onerror = () => {
+
+  recognition.onerror = (evt) => {
     listening = false;
     micBtn.classList.remove("listening");
+    if (voiceStatusEl.classList.contains("listening")) showVoiceStatus(null);
+    if (evt.error && evt.error !== "no-speech" && evt.error !== "aborted") {
+      console.warn("speech recognition error:", evt.error);
+    }
   };
 } else {
   micBtn.disabled = true;
@@ -301,6 +366,12 @@ micBtn.addEventListener("click", () => {
     stopSpeaking();
     listening = true;
     micBtn.classList.add("listening");
-    recognition.start();
+    try {
+      recognition.start();
+    } catch {
+      // Some browsers throw if start() is called too quickly after stop()
+      listening = false;
+      micBtn.classList.remove("listening");
+    }
   }
 });
