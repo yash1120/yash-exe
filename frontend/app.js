@@ -1,17 +1,13 @@
 // Yash.exe — frontend chat + voice glue.
 //
-// Voice latency strategy:
-// - LLM tokens stream from /api/chat/stream over SSE.
-// - As tokens arrive, we accumulate a "speak buffer" and chip off complete sentence
-//   chunks (sentence-ending punctuation + space, min 30 chars) — each chunk fires a
-//   parallel /api/tts request. TTS requests synthesize concurrently.
-// - Audio blobs play strictly in order via an in-order queue.
-// - First audio plays ~1.0-1.5s after the user finishes speaking.
-//
-// Voice UX:
-// - A prominent status banner above the composer shows "Listening" (with live transcript)
-//   and "Yash is speaking" (with audio waves) so the user always knows the system's state.
-// - Web Speech API's interimResults stream gives a live preview of the transcription.
+// Voice/text sync strategy (the important bit):
+// - In voice mode, we DO NOT show the LLM's text as it streams in. We buffer it.
+// - As complete sentences arrive, we fire parallel /api/tts requests (audio queue).
+// - Each queue item carries a callback that reveals THAT sentence's text the
+//   moment its audio starts playing (audio.onplay).
+// - Result: text and audio appear in lock-step. The user doesn't read the whole
+//   reply 4 seconds before hearing it.
+// - In text mode (no mic), text streams normally — no waiting.
 
 const chatEl = document.getElementById("chat");
 const welcomeEl = document.getElementById("welcome");
@@ -28,17 +24,20 @@ const history = [];
 let voiceMode = false;
 let abortCtrl = null;
 
-// Audio queue. Each item is a Promise<Blob|null> so TTS requests can run in
-// parallel while playback strictly serialises.
-let audioQueue = [];
+let audioQueue = [];     // [{ blobPromise, onPlay }]
 let isPlayingAudio = false;
 let currentAudio = null;
 let ttsAborter = null;
 
-const MIN_CHUNK_LEN = 30;
+const MIN_CHUNK_LEN = 22;
+const COMMA_CHUNK_LEN = 60;
 const LONG_NO_PUNCT_LEN = 90;
 
-// --- UI helpers ---
+// Common abbreviations whose trailing "." is NOT a sentence end. Keep tight —
+// too aggressive a list creates run-on chunks.
+const ABBREV_TAIL = /(?:^|\s)(?:Dr|Mr|Mrs|Ms|St|vs|etc|cf|Jr|Sr|Inc|Co|Ltd|Corp|Prof|No|Ph\.D|M\.D|B\.A|M\.A|B\.S|M\.S|U\.S|U\.K|e\.g|i\.e)\.$/;
+
+// --- DOM helpers ---
 
 function hideWelcome() {
   if (welcomeEl && !welcomeEl.hidden) welcomeEl.hidden = true;
@@ -84,6 +83,15 @@ function showVoiceStatus(state, opts = {}) {
         <strong>Listening</strong>
         <span class="voice-sub" id="live-transcript">${sub}</span>
       </div>`;
+  } else if (state === "thinking") {
+    voiceStatusEl.innerHTML = `
+      <span class="thinking-icon">
+        <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+      </span>
+      <div class="voice-text">
+        <strong>Thinking</strong>
+        <span class="voice-sub">writing a reply, voice coming…</span>
+      </div>`;
   } else if (state === "speaking") {
     voiceStatusEl.innerHTML = `
       <div class="voice-waves">
@@ -122,10 +130,13 @@ async function synthesizeBlob(text, signal) {
   }
 }
 
-function queueSpeak(text) {
+function queueSpeak(text, onPlayCallback) {
   const trimmed = text && text.trim();
   if (!trimmed) return;
-  audioQueue.push(synthesizeBlob(trimmed, ttsAborter?.signal));
+  audioQueue.push({
+    blobPromise: synthesizeBlob(trimmed, ttsAborter?.signal),
+    onPlay: onPlayCallback || (() => {}),
+  });
   playNextAudio();
 }
 
@@ -136,16 +147,32 @@ async function playNextAudio() {
     return;
   }
   isPlayingAudio = true;
-  showVoiceStatus("speaking");
-  const blob = await audioQueue.shift();
+  // Show "speaking" the moment we start consuming the queue (covers the brief
+  // window between thinking and the first audio actually firing).
+  if (!voiceStatusEl.classList.contains("speaking")) showVoiceStatus("speaking");
+
+  const item = audioQueue.shift();
+  const blob = await item.blobPromise;
+
   if (!blob || !blob.size) {
+    // TTS failed for this chunk — reveal text anyway so the conversation isn't stuck.
+    try { item.onPlay(); } catch {}
     isPlayingAudio = false;
     playNextAudio();
     return;
   }
+
   const url = URL.createObjectURL(blob);
   const audio = new Audio(url);
   currentAudio = audio;
+  let revealed = false;
+  const revealOnce = () => {
+    if (revealed) return;
+    revealed = true;
+    try { item.onPlay(); } catch {}
+  };
+
+  audio.onplay = revealOnce;
   audio.onended = () => {
     URL.revokeObjectURL(url);
     isPlayingAudio = false;
@@ -154,6 +181,7 @@ async function playNextAudio() {
   };
   audio.onerror = () => {
     URL.revokeObjectURL(url);
+    revealOnce();
     isPlayingAudio = false;
     playNextAudio();
   };
@@ -161,6 +189,7 @@ async function playNextAudio() {
     await audio.play();
   } catch (err) {
     console.warn("audio.play failed", err);
+    revealOnce();
     isPlayingAudio = false;
     playNextAudio();
   }
@@ -168,7 +197,11 @@ async function playNextAudio() {
 
 function stopSpeaking() {
   ttsAborter?.abort();
-  audioQueue = [];
+  // Reveal any text whose audio never got to play, so the chat isn't half-written.
+  while (audioQueue.length > 0) {
+    const item = audioQueue.shift();
+    try { item.onPlay?.(); } catch {}
+  }
   isPlayingAudio = false;
   if (currentAudio) {
     try { currentAudio.pause(); } catch {}
@@ -177,23 +210,41 @@ function stopSpeaking() {
   if (voiceStatusEl.classList.contains("speaking")) showVoiceStatus(null);
 }
 
+// Smart sentence-boundary chunker. Skips obvious abbreviations.
 function takeSpeakableChunk(buffer) {
   if (buffer.length < MIN_CHUNK_LEN) return null;
+
+  // Find the last real sentence-end (avoiding common abbreviations).
   let lastIdx = -1;
-  const re = /[.!?]\s+/g;
+  const re = /[.!?]+\s+/g;
   let m;
   while ((m = re.exec(buffer)) !== null) {
+    const before = buffer.slice(0, m.index + 1);
+    if (ABBREV_TAIL.test(before)) continue;
+    // Skip single-letter initials like "A." (often "A.I.", "U.S.")
+    if (/\s[A-Z]\.$/.test(before)) continue;
     lastIdx = m.index + m[0].length;
   }
   if (lastIdx >= MIN_CHUNK_LEN) {
     return [buffer.slice(0, lastIdx).trim(), buffer.slice(lastIdx)];
   }
-  if (buffer.length > LONG_NO_PUNCT_LEN) {
+
+  // Comma fallback for long clause-heavy sentences
+  if (buffer.length >= COMMA_CHUNK_LEN) {
     const commaIdx = buffer.lastIndexOf(", ");
-    if (commaIdx > MIN_CHUNK_LEN) {
+    if (commaIdx >= MIN_CHUNK_LEN) {
       return [buffer.slice(0, commaIdx + 1).trim(), buffer.slice(commaIdx + 2)];
     }
   }
+
+  // Hard cap: chunk at any space if we've gone too long without punctuation
+  if (buffer.length > LONG_NO_PUNCT_LEN) {
+    const spaceIdx = buffer.lastIndexOf(" ", LONG_NO_PUNCT_LEN);
+    if (spaceIdx >= MIN_CHUNK_LEN) {
+      return [buffer.slice(0, spaceIdx).trim(), buffer.slice(spaceIdx + 1)];
+    }
+  }
+
   return null;
 }
 
@@ -224,11 +275,23 @@ async function sendMessage(message) {
   input.value = "";
   setBusy(true);
 
-  const assistantEl = addMessage("assistant", "", { streaming: true });
+  // In voice mode, suppress the streaming caret and show "Thinking" in the banner.
+  const wasVoice = voiceMode;
+  const assistantEl = addMessage("assistant", "", { streaming: !wasVoice });
+  if (wasVoice) showVoiceStatus("thinking");
+
   let fullReply = "";
   let speakBuf = "";
+  let revealedText = "";
   abortCtrl = new AbortController();
   ttsAborter = new AbortController();
+
+  // Reveals one TTS chunk's worth of text to the bubble. Called from audio.onplay.
+  function revealChunk(chunkText) {
+    revealedText = revealedText ? `${revealedText} ${chunkText}` : chunkText;
+    assistantEl.textContent = revealedText;
+    chatEl.scrollTop = chatEl.scrollHeight;
+  }
 
   try {
     const res = await fetch("/api/chat/stream", {
@@ -255,17 +318,20 @@ async function sendMessage(message) {
         if (data === "[DONE]") continue;
         const chunk = data.replace(/\\n/g, "\n");
         fullReply += chunk;
-        assistantEl.textContent = fullReply;
-        chatEl.scrollTop = chatEl.scrollHeight;
 
-        if (voiceMode) {
+        if (wasVoice) {
+          // Voice mode: buffer text, fire TTS per sentence, reveal on audio.onplay.
           speakBuf += chunk;
           let split;
           while ((split = takeSpeakableChunk(speakBuf)) !== null) {
             const [toSpeak, rest] = split;
-            queueSpeak(toSpeak);
+            queueSpeak(toSpeak, () => revealChunk(toSpeak));
             speakBuf = rest;
           }
+        } else {
+          // Text mode: show as it streams.
+          assistantEl.textContent = fullReply;
+          chatEl.scrollTop = chatEl.scrollHeight;
         }
       }
     }
@@ -273,17 +339,26 @@ async function sendMessage(message) {
     assistantEl.classList.remove("streaming");
     if (fullReply) {
       history.push({ role: "assistant", content: fullReply });
-      if (voiceMode && speakBuf.trim()) {
-        queueSpeak(speakBuf);
+      if (wasVoice && speakBuf.trim()) {
+        const remaining = speakBuf.trim();
+        queueSpeak(remaining, () => revealChunk(remaining));
       }
     }
   } catch (err) {
     assistantEl.classList.remove("streaming");
+    if (wasVoice && fullReply && revealedText.length < fullReply.length) {
+      // Audio path failed — make sure user sees the full reply text.
+      assistantEl.textContent = fullReply;
+      showVoiceStatus(null);
+    }
     if (err.name === "AbortError") {
-      assistantEl.textContent = fullReply + " ⏹";
-      if (fullReply) history.push({ role: "assistant", content: fullReply });
+      if (fullReply && !history.includes({ role: "assistant", content: fullReply })) {
+        history.push({ role: "assistant", content: fullReply });
+      }
     } else {
-      assistantEl.textContent = `Sorry — something broke: ${err.message}.`;
+      if (!assistantEl.textContent) {
+        assistantEl.textContent = `Sorry — something broke: ${err.message}.`;
+      }
     }
   } finally {
     setBusy(false);
@@ -331,7 +406,6 @@ if (SR) {
     }
     if (final.trim()) {
       voiceMode = true;
-      showVoiceStatus(null);
       sendMessage(final.trim());
     }
   };
@@ -339,10 +413,8 @@ if (SR) {
   recognition.onend = () => {
     listening = false;
     micBtn.classList.remove("listening");
-    // If we ended without a final result, hide the banner.
-    if (!voiceMode && voiceStatusEl.classList.contains("listening")) {
-      showVoiceStatus(null);
-    }
+    // Only hide if we were still in listening state (sendMessage swaps to "thinking")
+    if (voiceStatusEl.classList.contains("listening")) showVoiceStatus(null);
   };
 
   recognition.onerror = (evt) => {
@@ -369,7 +441,6 @@ micBtn.addEventListener("click", () => {
     try {
       recognition.start();
     } catch {
-      // Some browsers throw if start() is called too quickly after stop()
       listening = false;
       micBtn.classList.remove("listening");
     }
